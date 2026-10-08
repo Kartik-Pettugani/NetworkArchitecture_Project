@@ -1,22 +1,4 @@
-"""
-HTTP, in Binary - V1 protocol implementation.
-
-Wire format:
-    Frame header = 8 bytes, big-endian
-      Length : 4 bytes  (payload length only)
-      Type   : 1 byte
-      Flags  : 1 byte
-      ID     : 2 bytes
-
-Types:
-    0x01 REQUEST
-    0x02 RESPONSE
-    0x03 DATA
-    0x04-0xFF unknown/reserved
-
-Flags:
-    0x01 END
-"""
+"""HTTP, in Binary protocol primitives."""
 
 import socket
 import struct
@@ -63,6 +45,7 @@ class Frame:
     flags: int
     id: int
     payload: bytes
+    raw: bytes = b""
 
 
 def read_exact(sock, n):
@@ -93,26 +76,20 @@ def encode_frame(frame_type, flags, frame_id, payload=b""):
 
 
 def read_frame(sock):
-    """
-    Read one complete frame.
-
-    Returns None for clean EOF exactly at a frame boundary.
-    Raises TruncatedFrame for a partial header/payload.
-    Raises ProtocolError for an oversized frame.
-    """
+    """Read one complete frame; return None for clean EOF at a boundary."""
     header = read_exact(sock, HEADER_SIZE)
     if header is None:
         return None
 
     length, frame_type, flags, frame_id = struct.unpack("!IBBH", header)
-
     if length > MAX_FRAME_SIZE:
         raise ProtocolError(f"frame length {length} exceeds MAX_FRAME_SIZE")
 
     payload = read_exact(sock, length)
     if payload is None:
         raise TruncatedFrame("EOF after frame header")
-    return Frame(length, frame_type, flags, frame_id, payload)
+    raw = header + payload
+    return Frame(length, frame_type, flags, frame_id, payload, raw)
 
 
 def encode_indexed_header(index, value):
@@ -135,11 +112,6 @@ def encode_literal_header(name, value):
 
 
 def encode_headers(headers):
-    """
-    Encode a list of (name, value) pairs.
-    Static-table names use indexed encoding by default.
-    Unknown/custom names use literal encoding.
-    """
     out = bytearray()
     for name, value in headers:
         if name in HEADER_INDEX:
@@ -150,12 +122,7 @@ def encode_headers(headers):
 
 
 def decode_headers(payload):
-    """
-    Decode a header block.
-
-    Unknown indexed header numbers 11-254 are skipped after consuming
-    their length-prefixed value, providing forward compatibility.
-    """
+    """Decode a complete header block."""
     headers = []
     pos = 0
 
@@ -194,13 +161,12 @@ def decode_headers(payload):
             raise ProtocolError("truncated indexed header value length")
         value_len = payload[pos]
         pos += 1
-
         if pos + value_len > len(payload):
             raise ProtocolError("truncated indexed header value")
+
         value_bytes = payload[pos:pos + value_len]
         pos += value_len
 
-        # 1-10 are defined. 11-254 are reserved/future and ignored.
         if index <= 10:
             name = HEADER_NAMES[index]
             try:
@@ -208,6 +174,7 @@ def decode_headers(payload):
             except UnicodeDecodeError as e:
                 raise ProtocolError("invalid UTF-8 header value") from e
             headers.append((name, value))
+        # 11-254 are reserved/future: value was consumed, so skip the header.
 
     return headers
 
@@ -220,7 +187,6 @@ def headers_to_dict(headers):
 
 
 def hexdump(data):
-    """Compact annotated-friendly hexdump."""
     lines = []
     for offset in range(0, len(data), 16):
         chunk = data[offset:offset + 16]

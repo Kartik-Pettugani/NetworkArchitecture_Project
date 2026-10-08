@@ -1,12 +1,13 @@
 import os
 import socket
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from protocol import (
     TYPE_REQUEST, TYPE_RESPONSE, TYPE_DATA,
-    FLAG_END, MAX_FRAME_SIZE, DATA_CHUNK_SIZE,
+    FLAG_END, DATA_CHUNK_SIZE,
     ProtocolError, TruncatedFrame,
     read_frame, encode_frame, encode_headers, decode_headers, headers_to_dict,
 )
@@ -28,52 +29,83 @@ def http_date():
     return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
+def error_payload(status):
+    return encode_headers([
+        (":status", str(status)),
+        ("server", "bserve-python/1.0"),
+        ("date", http_date()),
+    ])
+
+
 def send_error(conn, status, frame_id):
-    payload = encode_headers([(":status", str(status))])
-    frame = encode_frame(TYPE_RESPONSE, FLAG_END, frame_id, payload)
-    conn.sendall(frame)
+    conn.sendall(encode_frame(TYPE_RESPONSE, FLAG_END, frame_id, error_payload(status)))
+
+
+def drain_after_write_shutdown(conn):
+    """Drain peer data after our write side is closed, avoiding a reset."""
+    try:
+        conn.settimeout(0.25)
+        while conn.recv(4096):
+            pass
+    except (socket.timeout, OSError):
+        pass
+    finally:
+        try:
+            conn.settimeout(None)
+        except OSError:
+            pass
 
 
 def send_400_and_close(conn):
     try:
-        conn.sendall(encode_frame(TYPE_RESPONSE, FLAG_END, 0,
-                                   encode_headers([(":status", "400")])))
+        conn.sendall(encode_frame(TYPE_RESPONSE, FLAG_END, 0, error_payload(400)))
         try:
             conn.shutdown(socket.SHUT_WR)
         except OSError:
-            pass
+            return
+        drain_after_write_shutdown(conn)
     except OSError:
         pass
 
 
 def safe_resolve(root, request_path):
-    # V1 does not support query strings or percent-decoding.
     if not request_path or not request_path.startswith("/"):
         raise ValueError("invalid path")
     if "\x00" in request_path:
         raise ValueError("NUL in path")
-    if "?" in request_path or "%" in request_path:
-        raise ValueError("query strings and percent-decoding unsupported")
+    if "?" in request_path or "%" in request_path or "\\" in request_path:
+        raise ValueError("query strings, percent-decoding, and backslashes unsupported")
 
-    # Convert URL-like path to a filesystem-relative path.
     relative = request_path.lstrip("/")
-    candidate = root / relative
+    if any(part == ".." for part in Path(relative).parts):
+        raise ValueError("path traversal")
 
+    candidate = root / relative
     try:
         resolved_root = root.resolve(strict=True)
         resolved = candidate.resolve(strict=False)
-    except OSError:
-        raise FileNotFoundError
+    except OSError as e:
+        raise FileNotFoundError from e
 
     root_prefix = str(resolved_root) + os.sep
     if str(resolved) != str(resolved_root) and not str(resolved).startswith(root_prefix):
         raise ValueError("path traversal")
 
-    # Explicit .. components are rejected by the protocol.
-    if any(part == ".." for part in Path(relative).parts):
-        raise ValueError("path traversal")
-
     return resolved
+
+
+def validate_request_headers(headers):
+    """Enforce singleton pseudo headers and no duplicate non-pseudo headers."""
+    h = headers_to_dict(headers)
+
+    if len(h.get(":method", [])) != 1 or len(h.get(":path", [])) != 1:
+        raise ValueError("missing or duplicate required pseudo header")
+
+    for name, values in h.items():
+        if not name.startswith(":") and len(values) > 1:
+            raise ValueError(f"duplicate header: {name}")
+
+    return h
 
 
 def handle_request(conn, root, frame):
@@ -81,28 +113,15 @@ def handle_request(conn, root, frame):
         send_error(conn, 400, frame.id)
         return
 
-    if frame.flags & ~FLAG_END:
-        # Undefined flags are ignored by the protocol.
-        pass
+    # ID 0 is reserved for connection-level malformed-frame errors.
+    if frame.id == 0:
+        send_error(conn, 400, 0)
+        return
 
     try:
         headers = decode_headers(frame.payload)
-    except (ProtocolError, UnicodeError):
-        send_error(conn, 400, frame.id)
-        return
-
-    h = headers_to_dict(headers)
-
-    # Required and singleton pseudo headers.
-    if len(h.get(":method", [])) != 1 or len(h.get(":path", [])) != 1:
-        send_error(conn, 400, frame.id)
-        return
-
-    if len(h.get(":method", [])) > 1 or len(h.get(":path", [])) > 1:
-        send_error(conn, 400, frame.id)
-        return
-
-    if "content-length" in h and len(h["content-length"]) > 1:
+        h = validate_request_headers(headers)
+    except (ProtocolError, UnicodeError, ValueError):
         send_error(conn, 400, frame.id)
         return
 
@@ -126,8 +145,20 @@ def handle_request(conn, root, frame):
         send_error(conn, 404, frame.id)
         return
 
+    # Open before sending any response bytes. If opening/statting fails,
+    # the client can still receive the specified 500 response.
     try:
-        size = file_path.stat().st_size
+        f = file_path.open("rb")
+        try:
+            size = os.fstat(f.fileno()).st_size
+        except OSError:
+            f.close()
+            raise
+    except OSError:
+        send_error(conn, 500, frame.id)
+        return
+
+    try:
         response_headers = encode_headers([
             (":status", "200"),
             ("content-length", str(size)),
@@ -137,31 +168,31 @@ def handle_request(conn, root, frame):
         ])
 
         if size == 0:
-            conn.sendall(encode_frame(TYPE_RESPONSE, FLAG_END, frame.id,
-                                      response_headers))
+            conn.sendall(encode_frame(TYPE_RESPONSE, FLAG_END, frame.id, response_headers))
             return
 
-        conn.sendall(encode_frame(TYPE_RESPONSE, 0, frame.id,
-                                   response_headers))
+        conn.sendall(encode_frame(TYPE_RESPONSE, 0, frame.id, response_headers))
 
-        with file_path.open("rb") as f:
-            while True:
-                chunk = f.read(DATA_CHUNK_SIZE)
-                if not chunk:
-                    break
-                # END belongs only to the final DATA frame.
-                next_pos = f.tell()
-                flags = FLAG_END if next_pos == size else 0
-                conn.sendall(encode_frame(TYPE_DATA, flags, frame.id, chunk))
+        bytes_sent = 0
+        while bytes_sent < size:
+            chunk = f.read(min(DATA_CHUNK_SIZE, size - bytes_sent))
+            if not chunk:
+                # The file changed after stat/open. Never advertise a complete
+                # response when fewer bytes than content-length were sent.
+                raise OSError("file shrank while being served")
+            bytes_sent += len(chunk)
+            flags = FLAG_END if bytes_sent == size else 0
+            conn.sendall(encode_frame(TYPE_DATA, flags, frame.id, chunk))
+
+        if bytes_sent != size:
+            raise OSError("file size changed while being served")
 
     except OSError:
-        # If response bytes were already sent, closing causes the client
-        # to detect a truncated response.
-        try:
-            conn.close()
-        except OSError:
-            pass
+        # Response bytes were already sent; closing makes the client detect
+        # truncation rather than falsely treating the response as complete.
         raise
+    finally:
+        f.close()
 
 
 def serve_client(conn, root):
@@ -177,12 +208,20 @@ def serve_client(conn, root):
         if frame is None:
             return
 
-        # A request frame is expected. Unknown frame types are skipped
-        # cleanly and do not disturb the persistent connection.
         if frame.type not in (TYPE_REQUEST, TYPE_RESPONSE, TYPE_DATA):
             continue
 
         handle_request(conn, root, frame)
+
+
+def client_thread(conn, addr, root):
+    try:
+        print(f"connection from {addr}")
+        serve_client(conn, root)
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        conn.close()
 
 
 def main():
@@ -207,13 +246,11 @@ def main():
 
         while True:
             conn, addr = server.accept()
-            print(f"connection from {addr}")
-            try:
-                serve_client(conn, root)
-            except (ConnectionError, OSError):
-                pass
-            finally:
-                conn.close()
+            threading.Thread(
+                target=client_thread,
+                args=(conn, addr, root),
+                daemon=True,
+            ).start()
     except KeyboardInterrupt:
         print("\nstopping")
     finally:

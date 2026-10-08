@@ -1,10 +1,11 @@
 import socket
 import sys
+import tempfile
 
 from protocol import (
     TYPE_REQUEST, TYPE_RESPONSE, TYPE_DATA,
     FLAG_END, ProtocolError, TruncatedFrame,
-    encode_frame, encode_headers, read_frame, hexdump,
+    encode_frame, encode_headers, read_frame, decode_headers, hexdump,
 )
 
 
@@ -33,14 +34,8 @@ def send_frame(sock, frame, verbose):
 def recv_frame(sock, verbose):
     frame = read_frame(sock)
     if frame is not None and verbose:
-        raw = (
-            frame.length.to_bytes(4, "big")
-            + bytes([frame.type, frame.flags])
-            + frame.id.to_bytes(2, "big")
-            + frame.payload
-        )
         print("<<", file=sys.stderr)
-        print(hexdump(raw), file=sys.stderr)
+        print(hexdump(frame.raw), file=sys.stderr)
     return frame
 
 
@@ -51,32 +46,53 @@ def request_one(sock, host, path, request_id, verbose):
         ("host", host),
         ("user-agent", "bcurl-python/1.0"),
         ("accept", "*/*"),
-        ("x-request-id", "abcd"),  # demonstrates literal encoding
+        ("x-request-id", "abcd"),
     ]
     payload = encode_headers(headers)
     request = encode_frame(TYPE_REQUEST, FLAG_END, request_id, payload)
     send_frame(sock, request, verbose)
 
-    frame = recv_frame(sock, verbose)
-    if frame is None:
-        raise RuntimeError("server closed connection before response")
+    # Unknown frame types are explicitly skipped while waiting for RESPONSE.
+    while True:
+        frame = recv_frame(sock, verbose)
+        if frame is None:
+            raise RuntimeError("server closed connection before response")
+        if frame.type not in (TYPE_RESPONSE, TYPE_DATA, TYPE_REQUEST):
+            continue
+        break
 
     if frame.type != TYPE_RESPONSE:
         raise RuntimeError(f"expected RESPONSE, got type 0x{frame.type:02x}")
 
-    if frame.id != request_id:
-        # ID 0 is reserved for malformed-frame responses.
-        raise RuntimeError(f"response ID mismatch: expected {request_id}, got {frame.id}")
-
     try:
-        headers = dict(__import__("protocol").decode_headers(frame.payload))
-    except Exception as e:
+        response_headers = decode_headers(frame.payload)
+    except (ProtocolError, UnicodeError) as e:
         raise RuntimeError("invalid response headers") from e
 
-    if ":status" not in headers:
+    header_dict = {}
+    for name, value in response_headers:
+        if name in header_dict:
+            raise RuntimeError(f"duplicate response header: {name}")
+        header_dict[name] = value
+
+    if ":status" not in header_dict:
         raise RuntimeError("response missing :status")
 
-    status = int(headers[":status"])
+    try:
+        status = int(header_dict[":status"])
+    except ValueError as e:
+        raise RuntimeError("invalid response status") from e
+
+    # ID 0 is valid only for the server's 400 response to a malformed frame.
+    if frame.id == 0:
+        if not (status == 400 and (frame.flags & FLAG_END)):
+            raise RuntimeError("ID 0 is only valid for a malformed-frame 400")
+        return status
+
+    if frame.id != request_id:
+        raise RuntimeError(
+            f"response ID mismatch: expected {request_id}, got {frame.id}"
+        )
 
     if status >= 400:
         if not (frame.flags & FLAG_END):
@@ -86,45 +102,59 @@ def request_one(sock, host, path, request_id, verbose):
     if status != 200:
         raise RuntimeError(f"unsupported response status {status}")
 
-    if "content-length" not in headers:
+    if "content-length" not in header_dict:
         raise RuntimeError("200 response missing content-length")
 
-    expected = int(headers["content-length"])
+    try:
+        expected = int(header_dict["content-length"])
+    except ValueError as e:
+        raise RuntimeError("invalid content-length") from e
+    if expected < 0:
+        raise RuntimeError("negative content-length")
+
     body_received = 0
-
-    if frame.flags & FLAG_END:
-        if expected != 0:
-            raise RuntimeError("response ended before body was received")
-        return status
-
-    while True:
-        frame = recv_frame(sock, verbose)
-        if frame is None:
-            raise RuntimeError("connection closed during response")
-
-        if frame.type != TYPE_DATA:
-            if frame.type not in (TYPE_REQUEST, TYPE_RESPONSE):
-                # Unknown types are skipped cleanly.
-                continue
-            raise RuntimeError(f"unexpected known frame type 0x{frame.type:02x}")
-
-        if frame.id != request_id:
-            raise RuntimeError("DATA frame ID mismatch")
-
-        sys.stdout.buffer.write(frame.payload)
-        sys.stdout.buffer.flush()
-        body_received += len(frame.payload)
-
-        if body_received > expected:
-            raise RuntimeError("received more DATA bytes than content-length")
-
+    # Buffer the body until framing and content-length have been validated.
+    # SpooledTemporaryFile keeps small bodies in memory and spills large ones to disk.
+    with tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b") as body:
         if frame.flags & FLAG_END:
-            break
+            if expected != 0:
+                raise RuntimeError("response ended before body was received")
+        else:
+            while True:
+                frame = recv_frame(sock, verbose)
+                if frame is None:
+                    raise RuntimeError("connection closed during response")
 
-    if body_received != expected:
-        raise RuntimeError(
-            f"content-length mismatch: expected {expected}, got {body_received}"
-        )
+                if frame.type not in (TYPE_DATA, TYPE_REQUEST, TYPE_RESPONSE):
+                    continue
+
+                if frame.type != TYPE_DATA:
+                    raise RuntimeError(f"unexpected known frame type 0x{frame.type:02x}")
+
+                if frame.id != request_id:
+                    raise RuntimeError("DATA frame ID mismatch")
+
+                body.write(frame.payload)
+                body_received += len(frame.payload)
+
+                if body_received > expected:
+                    raise RuntimeError("received more DATA bytes than content-length")
+
+                if frame.flags & FLAG_END:
+                    break
+
+        if body_received != expected:
+            raise RuntimeError(
+                f"content-length mismatch: expected {expected}, got {body_received}"
+            )
+
+        body.seek(0)
+        while True:
+            chunk = body.read(64 * 1024)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
 
     return status
 
@@ -140,7 +170,6 @@ def main():
         usage()
         return 2
 
-    # All targets in this invocation use one persistent TCP connection.
     first_host, first_port, _ = parse_target(args[0])
 
     request_id = 1
@@ -156,6 +185,7 @@ def main():
 
                 status = request_one(sock, host, path, request_id, verbose)
                 if status >= 400:
+                    print(f"bcurl: HTTP-Binary status {status}", file=sys.stderr)
                     return 1
 
                 request_id += 1

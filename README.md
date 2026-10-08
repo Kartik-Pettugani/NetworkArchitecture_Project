@@ -1,4 +1,4 @@
-# HTTP, in Binary — Python V1
+# HTTP, in Binary — Python
 
 A Windows-friendly implementation of the custom binary HTTP protocol.
 
@@ -11,11 +11,16 @@ A Windows-friendly implementation of the custom binary HTTP protocol.
 ## Project structure
 
 ```text
-binary_http_v1/
+binary_http/
 ├── bserve.py
 ├── bcurl.py
 ├── protocol.py
 ├── test_unknown.py
+├── test_malformed.py
+├── PROTOCOL.md
+├── DESIGN-NOTES.md
+├── examples/
+│   └── annotated-hexdump.md
 └── www/
     ├── index.html
     └── hello.txt
@@ -149,3 +154,19 @@ The test sends type `0x99`, which the server must skip, followed by a valid requ
 - The final DATA frame carries END.
 - An empty file uses RESPONSE+END and sends no empty DATA frame.
 - Path resolution rejects traversal outside the configured root.
+
+## Malformed-request recovery test
+
+```powershell
+python .\test_malformed.py 9000
+```
+
+The test sends a malformed request, verifies `400`, then sends a valid request on the same TCP connection and verifies `200`.
+
+## Client unknown-frame test
+
+```powershell
+python .\test_client_unknown.py
+```
+
+This starts a small local fake server, sends an unknown frame before the RESPONSE, and verifies that `bcurl` skips it and still receives the body.
